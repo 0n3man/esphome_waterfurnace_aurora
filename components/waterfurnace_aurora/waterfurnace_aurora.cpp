@@ -64,19 +64,26 @@ void WaterFurnaceAurora::send_request_common_(const uint8_t *frame, size_t frame
   if (this->flow_control_pin_ != nullptr) {
     this->flow_control_pin_->digital_write(true);
   }
-  
-  // Send frame — write_array buffers into the UART TX FIFO.
-  // We intentionally do NOT call flush() here. The hardware UART transmits
-  // asynchronously from its FIFO. flush() would block for up to ~106ms on a
-  // 200-byte frame at 19200 baud, exceeding the 50ms WARN_IF_BLOCKING threshold.
-  // Instead, the RS-485 flow control pin is switched back to RX by a deferred
-  // timeout, allowing the main loop to remain non-blocking.
+
+  // Write then flush() so TX is physically complete before we release DE/RE.
+  // On esp-idf, write_array() only queues into the UART ring buffer; without
+  // flush()/uart_wait_tx_done() an estimated delay races the hardware and can
+  // truncate our own frame. Flip the pin back to RX in this same call stack —
+  // deferring to a later loop() tick misses the head of fast ABC responses
+  // (device-ID 0x03 reads). Matches esphome/components/modbus. Aurora request
+  // frames are small; flush blocks on the order of a few–tens of ms at 19200.
   this->write_array(frame, frame_len);
-  
+  this->flush();
+
+  if (this->flow_control_pin_ != nullptr) {
+    this->flow_control_pin_->digital_write(false);
+  }
+
   this->pending_request_ = type;
   this->last_request_time_ = millis();
-  this->tx_complete_time_ = millis() + this->tx_time_ms_(frame_len);
-  this->transition_(State::TX_PENDING);
+  // Response timeout is measured from TX-complete / start-of-listen.
+  this->tx_complete_time_ = millis();
+  this->transition_(State::WAITING_RESPONSE);
 }
 
 void WaterFurnaceAurora::send_request_(const uint8_t *frame, size_t frame_len, PendingRequest type,
@@ -96,6 +103,23 @@ bool WaterFurnaceAurora::read_frame_() {
   // Drain available bytes into persistent rx_buffer_
   while (this->available() && this->rx_buffer_len_ < protocol::MAX_FRAME_SIZE) {
     this->rx_buffer_[this->rx_buffer_len_++] = this->read();
+  }
+  
+  // Resync: drop leading noise/glitch bytes until the configured slave address
+  // is at the front. expected_frame_size() trusts byte[0] as the address, so a
+  // single stray prefix would desync the parser for the rest of the exchange.
+  if (this->rx_buffer_len_ > 0 && this->rx_buffer_[0] != this->address_) {
+    size_t start = 0;
+    while (start < this->rx_buffer_len_ && this->rx_buffer_[start] != this->address_) {
+      start++;
+    }
+    if (start >= this->rx_buffer_len_) {
+      this->rx_buffer_len_ = 0;
+    } else if (start > 0) {
+      std::memmove(this->rx_buffer_.data(), this->rx_buffer_.data() + start,
+                   this->rx_buffer_len_ - start);
+      this->rx_buffer_len_ -= start;
+    }
   }
   
   if (this->rx_buffer_len_ < 2) return false;
@@ -157,8 +181,6 @@ void WaterFurnaceAurora::process_response_() {
   
   // Route to appropriate handler.
   // Handlers may chain to a new request (e.g. poll → fault history → dealer info).
-  // Only clear pending_request_ if the handler did NOT chain — detected by the
-  // state still being WAITING_RESPONSE (chained requests transition to TX_PENDING).
   switch (this->pending_request_) {
     case PendingRequest::SETUP_ID:
       this->process_setup_id_response_(resp);
@@ -190,12 +212,10 @@ void WaterFurnaceAurora::process_response_() {
       break;
   }
   
-  // Only clear pending_request_ if the handler did NOT chain to a new request.
-  // Chained requests (fault history, dealer info, medium poll) call send_request_()
-  // which transitions state to TX_PENDING and sets pending_request_ to the new type.
-  // Clearing it here would clobber the new request, causing the response to be
-  // silently discarded by the default case above.
-  if (this->state_ != State::TX_PENDING) {
+  // Chained handlers call send_request_*() which leaves state_ as WAITING_RESPONSE
+  // with pending_request_ already set to the new type — do not clobber it.
+  // Non-chaining handlers leave IDLE / ERROR_BACKOFF / setup follow-on states.
+  if (this->state_ != State::WAITING_RESPONSE) {
     this->pending_request_ = PendingRequest::NONE;
   }
 }
@@ -366,22 +386,8 @@ void WaterFurnaceAurora::loop() {
       // Otherwise just wait for update() to kick off a poll cycle
       return;
       
-    case State::TX_PENDING:
-      // Wait for UART TX FIFO to drain before switching RS-485 to RX mode.
-      // This avoids calling flush() which would block for up to ~110ms on
-      // large frames at 19200 baud, exceeding the 50ms loop() warning threshold.
-      if (now >= this->tx_complete_time_) {
-        // RS-485 turnaround: switch to RX mode now that TX is complete.
-        // 500µs margin is conservative for MAX485 transceivers.
-        if (this->flow_control_pin_ != nullptr) {
-          this->flow_control_pin_->digital_write(false);
-        }
-        this->transition_(State::WAITING_RESPONSE);
-      }
-      return;
-      
     case State::WAITING_RESPONSE: {
-      // Check timeout (measured from when TX completed, not when we started transmitting)
+      // Timeout measured from TX-complete / start-of-listen (see send_request_common_).
       if ((now - this->tx_complete_time_) > RESPONSE_TIMEOUT_MS) {
         this->handle_timeout_();
         return;
